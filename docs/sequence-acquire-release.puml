@@ -1,0 +1,69 @@
+@startuml sequence-acquire-release
+' Acquire and release flow
+' Render:  plantuml docs/sequence-acquire-release.puml
+
+title Acquire and Release
+
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+
+actor Caller
+participant "LeastConnections\nBalancer" as LB
+collections "Server[7]" as S
+participant Lease
+
+== Acquire ==
+
+Caller -> LB : acquire()
+
+group synchronized (lock)
+  LB -> LB : start = cursor++
+  loop each server, from the cursor offset
+    LB -> S : canAccept()
+    S --> LB : true / false
+    LB -> S : connectionCount()
+    S --> LB : count
+    note right of LB
+      strict "<" keeps the first server
+      at the lowest count, so ties
+      rotate with the cursor
+    end note
+  end
+  alt no server can accept
+    LB --> Caller : NoServerAvailableException
+  else winner found
+    LB -> S : incrementConnections()
+    note right of LB
+      Scan, capacity check and claim are
+      ONE atomic step. Splitting them is
+      the check-then-act race.
+    end note
+    LB -> Lease : new Lease(server, releaseCallback)
+    LB --> Caller : lease
+  end
+end
+
+== Caller holds the connection ==
+
+Caller -> Caller : do work\n(1 to 10 seconds in the simulation)
+
+== Release ==
+
+Caller -> Lease : close()
+Lease -> Lease : released.compareAndSet(false, true)
+
+alt CAS won (first call)
+  Lease -> LB : onRelease.run()
+  group synchronized (lock)
+    LB -> S : decrementConnections()
+    note right of LB
+      Same lock as selection, so a concurrent
+      acquire() can never see a half-applied
+      release.
+    end note
+  end
+else CAS lost (already released)
+  Lease --> Lease : return, no effect
+end
+
+@enduml

@@ -1,0 +1,125 @@
+@startuml class-diagram
+' Least-connections load balancer: class structure
+' Render:  plantuml docs/class-diagram.puml
+' Or paste into https://www.plantuml.com/plantuml
+
+title Least-Connections Load Balancer - Class Structure
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam linetype ortho
+hide empty members
+
+package "com.assignment.loadbalancer" {
+
+  interface PooledLoadBalancer {
+    + acquire() : Lease
+    + servers() : List<Server>
+  }
+
+  class LeastConnectionsBalancer {
+    - servers : List<Server>
+    - lock : Object
+    - cursor : int
+    + acquire() : Lease
+    + servers() : List<Server>
+    - selectLocked(start : int) : Server
+    - release(server : Server) : void
+  }
+  note bottom of LeastConnectionsBalancer
+    Scan, capacity check and claim happen
+    inside ONE lock: selecting a server and
+    then claiming it is check-then-act, and
+    atomic counters do not close that window.
+
+    cursor is a plain int, not an atomic:
+    it is only ever touched under the lock.
+  end note
+
+  class Lease {
+    - server : Server
+    - onRelease : Runnable
+    - released : AtomicBoolean
+    + server() : Server
+    + isReleased() : boolean
+    + close() : void
+  }
+  note right of Lease
+    AutoCloseable, so try-with-resources
+    releases even when the body throws.
+    close() is idempotent via Compare and Set.
+
+    Releases through a callback rather than
+    touching the Server, because counts may
+    only change under the balancer's lock.
+  end note
+
+  class Server {
+    + {static} UNLIMITED : int
+    - name : String
+    - capacity : int
+    - connectionCount : AtomicInteger
+    + name() : String
+    + capacity() : int
+    + connectionCount() : int
+    + canAccept() : boolean
+    ~ incrementConnections() : void
+    ~ decrementConnections() : void
+  }
+  note left of Server
+    Does NOT synchronise itself.
+    All mutation happens under the
+    balancer's lock. AtomicInteger is
+    for safe reads outside the lock,
+    not the synchronisation mechanism.
+  end note
+
+  class ServerPool <<utility>> {
+    + {static} defaultPool() : List<Server>
+    + {static} defaultPool(capacity : int) : List<Server>
+    + {static} named(names : String...) : List<Server>
+    + {static} named(capacity : int, names : String...) : List<Server>
+    + {static} defaultPoolWithCapacities(caps : Map) : List<Server>
+    + {static} withCapacities(names : List, caps : Map) : List<Server>
+  }
+
+  class NoServerAvailableException <<exception>> {
+    + NoServerAvailableException(message : String)
+  }
+  note bottom of NoServerAvailableException
+    Unchecked. Transient condition:
+    the contract is "retry shortly".
+  end note
+
+  class Simulation {
+    + {static} MIN_HOLD : Duration
+    + {static} MAX_HOLD : Duration
+    - balancer : PooledLoadBalancer
+    - holdMillis : LongSupplier
+    + {static} defaultHold(random : Random) : LongSupplier
+    + run(clients : int, requestsPerClient : int, timeout : Duration) : Result
+  }
+  note right of Simulation
+    The random 1 to 10 second hold
+    lives here, not in the balancer: a load
+    balancer has no say in how long a
+    caller's work takes.
+
+    The duration can be injected, so tests drive
+    the same code path in milliseconds.
+  end note
+
+  class Demo <<entry point>>
+}
+
+PooledLoadBalancer <|.. LeastConnectionsBalancer
+LeastConnectionsBalancer o--> "1..7*" Server : selects from,\nmutates under lock
+LeastConnectionsBalancer ..> Lease : creates with\na release callback
+LeastConnectionsBalancer ..> NoServerAvailableException : throws
+Lease --> Server : reports
+ServerPool ..> Server : builds
+Simulation --> PooledLoadBalancer : drives with\nconcurrent clients
+Demo ..> Simulation
+Demo ..> LeastConnectionsBalancer
+
+@enduml
